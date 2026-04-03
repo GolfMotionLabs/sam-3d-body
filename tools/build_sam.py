@@ -43,7 +43,7 @@ def load_sam3(device, path):
     from sam3.model_builder import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
     
-    model = build_sam3_image_model()
+    model = build_sam3_image_model(checkpoint_path=path)
     predictor = Sam3Processor(model)
     return predictor
 
