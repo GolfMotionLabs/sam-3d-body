@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sam_3d_body.data.utils.prepare_batch import prepare_batch
+from sam_3d_body.data.utils.prepare_batch import concat_person_batches, prepare_batch
 from sam_3d_body.models.decoders.prompt_encoder import PositionEmbeddingRandom
 from sam_3d_body.models.modules.mhr_utils import (
     fix_wrist_euler,
@@ -1194,6 +1194,31 @@ class SAM3DBody(BaseModel):
 
         return pose_output
 
+    def _prepare_hand_batch_multiframe(
+        self, imgs, transform_hand, boxes, counts, cam_int, flip
+    ):
+        """Build a hand batch whose instances are cropped from different frames.
+
+        This is the multi-frame counterpart of the single-image
+        ``prepare_batch(img, transform_hand, boxes, ...)`` call in ``run_inference``.
+        ``boxes`` is ``(M, 4)`` in frame-major order, ``counts`` gives how many of
+        those boxes belong to each frame in ``imgs`` (``sum(counts) == M``), and
+        ``flip`` horizontally flips each frame's pixels for the left-hand path (the
+        boxes themselves are already flipped by the caller using the shared width).
+        """
+        sub_batches = []
+        start = 0
+        for img_i, count in zip(imgs, counts):
+            if count == 0:
+                continue
+            boxes_i = boxes[start : start + count]
+            start += count
+            frame = img_i[:, ::-1] if flip else img_i
+            sub_batches.append(
+                prepare_batch(frame, transform_hand, boxes_i, cam_int=cam_int.clone())
+            )
+        return concat_person_batches(sub_batches)
+
     def run_inference(
         self,
         img,
@@ -1201,6 +1226,8 @@ class SAM3DBody(BaseModel):
         inference_type: str = "full",
         transform_hand: Any = None,
         thresh_wrist_angle=1.4,
+        imgs=None,
+        counts=None,
     ):
         """
         Run 3DB inference (optionally with hand detector).
@@ -1209,6 +1236,14 @@ class SAM3DBody(BaseModel):
             - full: full-body inference with both body and hand decoders
             - body: inference with body decoder only (still full-body output)
             - hand: inference with hand decoder only (only hand output)
+
+        Multi-frame batched inference (``process_images``): when the instances in
+        ``batch`` originate from more than one frame, pass ``imgs`` (list of the
+        per-frame RGB arrays) and ``counts`` (instances contributed by each frame,
+        frame-major, ``sum(counts) == batch["img"].shape[1]``). They are only used
+        by ``inference_type="full"`` to re-crop each instance's hands from its own
+        frame. ``img`` is then just a representative frame (all frames share H, W).
+        When ``imgs`` is ``None`` the original single-image behaviour is used.
         """
 
         height, width = img.shape[:2]
@@ -1235,14 +1270,21 @@ class SAM3DBody(BaseModel):
 
         # Step 2. Re-run with each hand
         ## Left... Flip image & box
-        flipped_img = img[:, ::-1]
         tmp = left_xyxy.copy()
         left_xyxy[:, 0] = width - tmp[:, 2] - 1
         left_xyxy[:, 2] = width - tmp[:, 0] - 1
 
-        batch_lhand = prepare_batch(
-            flipped_img, transform_hand, left_xyxy, cam_int=cam_int.clone()
-        )
+        if imgs is None:
+            flipped_img = img[:, ::-1]
+            batch_lhand = prepare_batch(
+                flipped_img, transform_hand, left_xyxy, cam_int=cam_int.clone()
+            )
+        else:
+            # Multi-frame: crop each instance's left hand from its own frame
+            # (flipped horizontally, matching the single-image path above).
+            batch_lhand = self._prepare_hand_batch_multiframe(
+                imgs, transform_hand, left_xyxy, counts, cam_int, flip=True
+            )
         batch_lhand = recursive_to(batch_lhand, "cuda")
         lhand_output = self.forward_step(batch_lhand, decoder_type="hand")
 
@@ -1276,9 +1318,15 @@ class SAM3DBody(BaseModel):
         )
 
         ## Right...
-        batch_rhand = prepare_batch(
-            img, transform_hand, right_xyxy, cam_int=cam_int.clone()
-        )
+        if imgs is None:
+            batch_rhand = prepare_batch(
+                img, transform_hand, right_xyxy, cam_int=cam_int.clone()
+            )
+        else:
+            # Multi-frame: crop each instance's right hand from its own frame.
+            batch_rhand = self._prepare_hand_batch_multiframe(
+                imgs, transform_hand, right_xyxy, counts, cam_int, flip=False
+            )
         batch_rhand = recursive_to(batch_rhand, "cuda")
         rhand_output = self.forward_step(batch_rhand, decoder_type="hand")
 

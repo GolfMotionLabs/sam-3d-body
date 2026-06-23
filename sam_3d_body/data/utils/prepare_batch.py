@@ -76,3 +76,49 @@ def prepare_batch(
 
     batch["img_ori"] = [NoCollate(img)]
     return batch
+
+
+# Per-instance keys produced by ``prepare_batch`` whose person dimension is axis 1.
+PERSON_BATCH_KEYS = [
+    "img",
+    "img_size",
+    "ori_img_size",
+    "bbox_center",
+    "bbox_scale",
+    "bbox",
+    "affine_trans",
+    "mask",
+    "mask_score",
+    "person_valid",
+]
+
+
+def concat_person_batches(batches):
+    """Concatenate several ``prepare_batch`` outputs along the instance axis.
+
+    Each input is a single-image batch whose per-instance tensors have the person
+    dimension at axis 1 (shape ``(1, Ni, ...)``). The crops from different images
+    are concatenated into one batch with ``sum(Ni)`` instances so they can be run
+    through the model together (e.g. batched multi-frame inference).
+
+    ``cam_int`` is treated as shared and the first batch's value is reused — callers
+    that batch across frames pass the same intrinsics to every ``prepare_batch``
+    call (static camera). ``img_ori`` lists are concatenated so the per-instance
+    original images remain available and aligned with the instance dimension.
+    """
+    if len(batches) == 1:
+        return batches[0]
+
+    out = {}
+    for key in PERSON_BATCH_KEYS:
+        if key in batches[0]:
+            out[key] = torch.cat([b[key] for b in batches], dim=1)
+
+    out["cam_int"] = batches[0]["cam_int"]
+
+    img_ori = []
+    for b in batches:
+        img_ori.extend(b.get("img_ori", []))
+    out["img_ori"] = img_ori
+
+    return out
